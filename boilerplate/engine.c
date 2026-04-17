@@ -14,8 +14,10 @@
  *   - producer/consumer behavior for log buffering
  *   - signal handling and graceful shutdown
  */
-
 #define _GNU_SOURCE
+#include <unistd.h>
+#include <sched.h>
+#include <sys/mount.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -47,7 +49,11 @@
 #define LOG_BUFFER_CAPACITY 16
 #define DEFAULT_SOFT_LIMIT (40UL << 20)
 #define DEFAULT_HARD_LIMIT (64UL << 20)
-
+typedef struct {
+    const char *container_id;
+    const char *rootfs;
+    const char *command;
+} container_args_t;
 typedef enum {
     CMD_SUPERVISOR = 0,
     CMD_START,
@@ -435,13 +441,104 @@ static int run_supervisor(const char *rootfs)
  * logging pipe. A UNIX domain socket is the most direct option, but a
  * FIFO or shared memory design is also acceptable if justified.
  */
-static int send_control_request(const control_request_t *req)
-{
-    (void)req;
-    fprintf(stderr, "Control-plane client path not implemented.\n");
+#define STACK_SIZE (1024 * 1024)
+static char child_stack[STACK_SIZE];
+
+int child_func(void *arg) {
+    container_args_t *args = (container_args_t *)arg;
+
+    printf("Inside container!\n");
+
+    // 1. change root
+    if (chroot(args->rootfs) != 0) {
+        perror("chroot failed");
+        return 1;
+    }
+
+    // 2. go to root directory
+    if (chdir("/") != 0) {
+        perror("chdir failed");
+        return 1;
+    }
+
+    // 3. mount /proc
+    if (mount("proc", "/proc", "proc", 0, NULL) != 0) {
+        perror("mount proc failed");
+        return 1;
+}// 4. set hostname
+    sethostname(args->container_id, strlen(args->container_id));
+
+    // 5. run command
+    char *cmd[] = { args->command, NULL };
+    execvp(cmd[0], cmd);
+
+    perror("exec failed");
     return 1;
 }
 
+static int send_control_request(const control_request_t *req)
+{
+    if (req->kind != CMD_START) {
+        printf("Only start implemented for now\n");
+        return 0;
+    }
+
+    printf("Starting container: %s\n", req->container_id);
+
+    // save running state
+    FILE *f2 = fopen("containers.txt", "a");
+    if (f2) {
+        fprintf(f2, "%s running\n", req->container_id);
+        fclose(f2);
+    }
+
+    container_args_t args;
+    args.container_id = req->container_id;
+    args.rootfs = req->rootfs;
+    args.command = req->command;
+
+    int flags = CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD;
+
+    pid_t pid = clone(child_func, child_stack + STACK_SIZE, flags, &args);
+
+    if (pid < 0) {
+        perror("clone failed");
+        return 1;
+    }
+
+    waitpid(pid, NULL, 0);
+
+    // update to exited (simple version for now)
+    FILE *f = fopen("containers.txt", "r");
+FILE *temp = fopen("temp.txt", "w");
+
+char id[100], state[100];
+int found = 0;
+
+if (f && temp) {
+    while (fscanf(f, "%s %s", id, state) != EOF) {
+        if (strcmp(id, req->container_id) == 0) {
+            fprintf(temp, "%s exited\n", id);
+            found = 1;
+        } else {
+            fprintf(temp, "%s %s\n", id, state);
+        }
+    }
+
+    if (!found) {
+        fprintf(temp, "%s exited\n", req->container_id);
+    }
+
+    fclose(f);
+    fclose(temp);
+
+    remove("containers.txt");
+    rename("temp.txt", "containers.txt");
+}
+
+    printf("Container exited\n");
+    return 0;
+}
 static int cmd_start(int argc, char *argv[])
 {
     control_request_t req;
@@ -494,23 +591,23 @@ static int cmd_run(int argc, char *argv[])
 
 static int cmd_ps(void)
 {
-    control_request_t req;
+    FILE *f = fopen("containers.txt", "r");
 
-    memset(&req, 0, sizeof(req));
-    req.kind = CMD_PS;
+    if (!f) {
+        printf("No containers found\n");
+        return 0;
+    }
 
-    /*
-     * TODO:
-     * The supervisor should respond with container metadata.
-     * Keep the rendering format simple enough for demos and debugging.
-     */
-    printf("Expected states include: %s, %s, %s, %s, %s\n",
-           state_to_string(CONTAINER_STARTING),
-           state_to_string(CONTAINER_RUNNING),
-           state_to_string(CONTAINER_STOPPED),
-           state_to_string(CONTAINER_KILLED),
-           state_to_string(CONTAINER_EXITED));
-    return send_control_request(&req);
+    char id[100], state[100];
+
+    printf("ID\tSTATE\n");
+
+    while (fscanf(f, "%s %s", id, state) != EOF) {
+        printf("%s\t%s\n", id, state);
+    }
+
+    fclose(f);
+    return 0;
 }
 
 static int cmd_logs(int argc, char *argv[])
