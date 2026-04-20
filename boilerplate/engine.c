@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -17,60 +18,27 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "monitor/monitor_ioctl.h"
+
 #define STACK_SIZE (1024 * 1024)
 #define CONTAINER_ID_LEN 32
 #define CONTROL_PATH "/tmp/mini_runtime.sock"
 #define LOG_DIR "logs"
-#define LOG_CHUNK_SIZE 4096
-#define LOG_BUFFER_CAPACITY 16
 
-/* ================= ENUMS ================= */
+typedef enum { CMD_START, CMD_RUN, CMD_PS, CMD_LOGS, CMD_STOP } cmd_t;
+typedef enum { RUNNING, EXITED, KILLED } state_t;
 
-typedef enum {
-    CMD_START,
-    CMD_RUN,
-    CMD_PS,
-    CMD_LOGS,
-    CMD_STOP
-} command_kind_t;
-
-typedef enum {
-    CONTAINER_STARTING,
-    CONTAINER_RUNNING,
-    CONTAINER_STOPPED,
-    CONTAINER_EXITED,
-    CONTAINER_KILLED
-} container_state_t;
-
-/* ================= STRUCTS ================= */
-
-typedef struct container_record {
+typedef struct container {
     char id[CONTAINER_ID_LEN];
     pid_t pid;
-    container_state_t state;
-    int exit_code;
-    int wait_fd; // for RUN
-    struct container_record *next;
-} container_record_t;
+    state_t state;
+    int wait_fd;
+    struct container *next;
+} container_t;
 
 typedef struct {
-    char container_id[CONTAINER_ID_LEN];
-    size_t len;
-    char data[LOG_CHUNK_SIZE];
-} log_item_t;
-
-typedef struct {
-    log_item_t items[LOG_BUFFER_CAPACITY];
-    int head, tail, count;
-    int shutdown;
-    pthread_mutex_t mtx;
-    pthread_cond_t not_empty;
-    pthread_cond_t not_full;
-} buffer_t;
-
-typedef struct {
-    command_kind_t kind;
-    char id[CONTAINER_ID_LEN];
+    cmd_t kind;
+    char id[32];
     char rootfs[PATH_MAX];
     char cmd[256];
 } request_t;
@@ -82,114 +50,13 @@ typedef struct {
 
 typedef struct {
     int server_fd;
-    buffer_t buf;
+    int monitor_fd;
+    container_t *list;
     pthread_mutex_t lock;
-    container_record_t *containers;
 } ctx_t;
 
-static ctx_t *g_ctx = NULL;
-static char child_stack[STACK_SIZE];
-
-/* ================= BUFFER ================= */
-
-void buffer_init(buffer_t *b)
-{
-    memset(b, 0, sizeof(*b));
-    pthread_mutex_init(&b->mtx, NULL);
-    pthread_cond_init(&b->not_empty, NULL);
-    pthread_cond_init(&b->not_full, NULL);
-}
-
-int buffer_push(buffer_t *b, log_item_t *item)
-{
-    pthread_mutex_lock(&b->mtx);
-
-    while (b->count == LOG_BUFFER_CAPACITY && !b->shutdown)
-        pthread_cond_wait(&b->not_full, &b->mtx);
-
-    if (b->shutdown) {
-        pthread_mutex_unlock(&b->mtx);
-        return -1;
-    }
-
-    b->items[b->tail] = *item;
-    b->tail = (b->tail + 1) % LOG_BUFFER_CAPACITY;
-    b->count++;
-
-    pthread_cond_signal(&b->not_empty);
-    pthread_mutex_unlock(&b->mtx);
-    return 0;
-}
-
-int buffer_pop(buffer_t *b, log_item_t *item)
-{
-    pthread_mutex_lock(&b->mtx);
-
-    while (b->count == 0 && !b->shutdown)
-        pthread_cond_wait(&b->not_empty, &b->mtx);
-
-    if (b->count == 0 && b->shutdown) {
-        pthread_mutex_unlock(&b->mtx);
-        return -1;
-    }
-
-    *item = b->items[b->head];
-    b->head = (b->head + 1) % LOG_BUFFER_CAPACITY;
-    b->count--;
-
-    pthread_cond_signal(&b->not_full);
-    pthread_mutex_unlock(&b->mtx);
-    return 0;
-}
-
-/* ================= LOGGING ================= */
-
-void *logger(void *arg)
-{
-    buffer_t *b = arg;
-    log_item_t item;
-
-    mkdir(LOG_DIR, 0755);
-
-    while (buffer_pop(b, &item) == 0) {
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path), "%s/%s.log", LOG_DIR, item.container_id);
-
-        int fd = open(path, O_CREAT | O_APPEND | O_WRONLY, 0644);
-        if (fd >= 0) {
-            write(fd, item.data, item.len);
-            close(fd);
-        }
-    }
-    return NULL;
-}
-
-/* ================= PRODUCER ================= */
-
-typedef struct {
-    char id[CONTAINER_ID_LEN];
-    int fd;
-    buffer_t *buf;
-} prod_args_t;
-
-void *producer(void *arg)
-{
-    prod_args_t *p = arg;
-    char buf[LOG_CHUNK_SIZE];
-    ssize_t n;
-
-    while ((n = read(p->fd, buf, sizeof(buf))) > 0) {
-        log_item_t item = {0};
-        strcpy(item.container_id, p->id);
-        item.len = n;
-        memcpy(item.data, buf, n);
-        if (buffer_push(p->buf, &item) != 0) break;
-    }
-
-    close(p->fd);
-    free(p);
-    return NULL;
-}
+static ctx_t *g_ctx;
+static char stack[STACK_SIZE];
 
 /* ================= CHILD ================= */
 
@@ -205,29 +72,54 @@ int child_fn(void *arg)
     char *argv[] = {"/bin/sh", "-c", r->cmd, NULL};
     execv("/bin/sh", argv);
 
+    perror("exec");
     return 1;
+}
+
+/* ================= MONITOR ================= */
+
+void register_monitor(ctx_t *ctx, char *id, pid_t pid)
+{
+    if (ctx->monitor_fd < 0) return;
+
+    struct monitor_request req = {0};
+    req.pid = pid;
+    req.soft_limit_bytes = 50UL << 20;
+    req.hard_limit_bytes = 80UL << 20;
+    strcpy(req.container_id, id);
+
+    ioctl(ctx->monitor_fd, MONITOR_REGISTER, &req);
+}
+
+void unregister_monitor(ctx_t *ctx, char *id, pid_t pid)
+{
+    if (ctx->monitor_fd < 0) return;
+
+    struct monitor_request req = {0};
+    req.pid = pid;
+    strcpy(req.container_id, id);
+
+    ioctl(ctx->monitor_fd, MONITOR_UNREGISTER, &req);
 }
 
 /* ================= SIGNAL ================= */
 
-void sigchld_handler(int sig)
+void sigchld(int sig)
 {
-    (void)sig;
     int status;
     pid_t pid;
 
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-        pthread_mutex_lock(&g_ctx->lock);
+        container_t *c = g_ctx->list;
 
-        container_record_t *c = g_ctx->containers;
         while (c) {
             if (c->pid == pid) {
-                if (WIFEXITED(status)) {
-                    c->state = CONTAINER_EXITED;
-                    c->exit_code = WEXITSTATUS(status);
-                } else {
-                    c->state = CONTAINER_KILLED;
-                }
+                unregister_monitor(g_ctx, c->id, pid);
+
+                if (WIFEXITED(status))
+                    c->state = EXITED;
+                else
+                    c->state = KILLED;
 
                 if (c->wait_fd >= 0) {
                     response_t res = {0};
@@ -240,25 +132,21 @@ void sigchld_handler(int sig)
             }
             c = c->next;
         }
-
-        pthread_mutex_unlock(&g_ctx->lock);
     }
 }
 
 /* ================= SUPERVISOR ================= */
 
-int run_supervisor()
+int supervisor()
 {
     ctx_t ctx = {0};
     g_ctx = &ctx;
 
     pthread_mutex_init(&ctx.lock, NULL);
-    buffer_init(&ctx.buf);
 
-    signal(SIGCHLD, sigchld_handler);
+    ctx.monitor_fd = open("/dev/container_monitor", O_RDWR);
 
     unlink(CONTROL_PATH);
-
     ctx.server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
 
     struct sockaddr_un addr = {0};
@@ -268,8 +156,7 @@ int run_supervisor()
     bind(ctx.server_fd, (struct sockaddr *)&addr, sizeof(addr));
     listen(ctx.server_fd, 5);
 
-    pthread_t log_thread;
-    pthread_create(&log_thread, NULL, logger, &ctx.buf);
+    signal(SIGCHLD, sigchld);
 
     printf("Supervisor running...\n");
 
@@ -282,71 +169,61 @@ int run_supervisor()
         response_t res = {0};
 
         if (req.kind == CMD_START || req.kind == CMD_RUN) {
-
-            int pipefd[2];
-            pipe(pipefd);
-
             request_t *child_req = malloc(sizeof(req));
             *child_req = req;
 
-            pid_t pid = clone(child_fn,
-                              child_stack + STACK_SIZE,
+            pid_t pid = clone(child_fn, stack + STACK_SIZE,
                               CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
                               child_req);
 
-            container_record_t *c = malloc(sizeof(*c));
+            container_t *c = malloc(sizeof(*c));
             strcpy(c->id, req.id);
             c->pid = pid;
-            c->state = CONTAINER_RUNNING;
+            c->state = RUNNING;
             c->wait_fd = (req.kind == CMD_RUN) ? fd : -1;
-            c->next = ctx.containers;
-            ctx.containers = c;
+            c->next = ctx.list;
+            ctx.list = c;
+
+            register_monitor(&ctx, req.id, pid);
 
             if (req.kind == CMD_START) {
-                sprintf(res.msg, "Started %s PID=%d", req.id, pid);
+                sprintf(res.msg, "Started %s pid=%d", req.id, pid);
                 send(fd, &res, sizeof(res), 0);
                 close(fd);
             }
-
-            prod_args_t *p = malloc(sizeof(*p));
-            strcpy(p->id, req.id);
-            p->fd = pipefd[0];
-            p->buf = &ctx.buf;
-
-            pthread_t t;
-            pthread_create(&t, NULL, producer, p);
-            pthread_detach(t);
         }
 
         else if (req.kind == CMD_PS) {
-            char *ptr = res.msg;
-            ptr += sprintf(ptr, "ID\tPID\tSTATE\n");
+            char *p = res.msg;
+            container_t *c = ctx.list;
 
-            container_record_t *c = ctx.containers;
             while (c) {
-                ptr += sprintf(ptr, "%s\t%d\t%d\n", c->id, c->pid, c->state);
+                p += sprintf(p, "%s %d %d\n", c->id, c->pid, c->state);
                 c = c->next;
             }
+
             send(fd, &res, sizeof(res), 0);
             close(fd);
         }
 
         else if (req.kind == CMD_STOP) {
-            container_record_t *c = ctx.containers;
+            container_t *c = ctx.list;
+
             while (c) {
-                if (strcmp(c->id, req.id) == 0) {
+                if (!strcmp(c->id, req.id)) {
                     kill(c->pid, SIGTERM);
                     sprintf(res.msg, "Stopped %s", req.id);
                     break;
                 }
                 c = c->next;
             }
+
             send(fd, &res, sizeof(res), 0);
             close(fd);
         }
 
         else if (req.kind == CMD_LOGS) {
-            sprintf(res.msg, "%s/%s.log", LOG_DIR, req.id);
+            sprintf(res.msg, "logs/%s.log", req.id);
             send(fd, &res, sizeof(res), 0);
             close(fd);
         }
@@ -382,7 +259,7 @@ int main(int argc, char *argv[])
     if (argc < 2) return 1;
 
     if (!strcmp(argv[1], "supervisor"))
-        return run_supervisor();
+        return supervisor();
 
     request_t req = {0};
 
