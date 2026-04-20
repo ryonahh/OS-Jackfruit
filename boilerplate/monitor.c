@@ -1,25 +1,22 @@
 #include <linux/module.h>
-#include <linux/kernel.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
 #include <linux/slab.h>
 
 #include "monitor_ioctl.h"
 
-#define DEVICE_NAME "container_monitor"
+#define DEVICE "container_monitor"
 
-struct entry {
+struct node {
     pid_t pid;
-    unsigned long soft;
-    unsigned long hard;
     char id[32];
-    struct entry *next;
+    struct node *next;
 };
 
-static struct entry *head = NULL;
+static struct node *head;
 static int major;
 
-static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
     struct monitor_request req;
 
@@ -27,33 +24,26 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         return -EFAULT;
 
     if (cmd == MONITOR_REGISTER) {
-        struct entry *e = kmalloc(sizeof(*e), GFP_KERNEL);
-        if (!e) return -ENOMEM;
+        struct node *n = kmalloc(sizeof(*n), GFP_KERNEL);
+        n->pid = req.pid;
+        strcpy(n->id, req.container_id);
+        n->next = head;
+        head = n;
 
-        e->pid = req.pid;
-        e->soft = req.soft_limit_bytes;
-        e->hard = req.hard_limit_bytes;
-        strncpy(e->id, req.container_id, 31);
-        e->id[31] = '\0';
-
-        e->next = head;
-        head = e;
-
-        printk(KERN_INFO "[monitor] REGISTER pid=%d id=%s\n", e->pid, e->id);
+        printk(KERN_INFO "[monitor] REGISTER %s pid=%d\n", n->id, n->pid);
     }
 
-    else if (cmd == MONITOR_UNREGISTER) {
-        struct entry **curr = &head;
-
-        while (*curr) {
-            if ((*curr)->pid == req.pid) {
-                struct entry *tmp = *curr;
-                *curr = (*curr)->next;
+    if (cmd == MONITOR_UNREGISTER) {
+        struct node **cur = &head;
+        while (*cur) {
+            if ((*cur)->pid == req.pid) {
+                struct node *tmp = *cur;
+                *cur = (*cur)->next;
                 kfree(tmp);
                 printk(KERN_INFO "[monitor] UNREGISTER pid=%d\n", req.pid);
                 break;
             }
-            curr = &(*curr)->next;
+            cur = &(*cur)->next;
         }
     }
 
@@ -62,23 +52,23 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 static struct file_operations fops = {
     .owner = THIS_MODULE,
-    .unlocked_ioctl = device_ioctl,
+    .unlocked_ioctl = dev_ioctl,
 };
 
-static int __init monitor_init(void)
+static int __init init_mod(void)
 {
-    major = register_chrdev(0, DEVICE_NAME, &fops);
-    printk(KERN_INFO "[monitor] loaded, major=%d\n", major);
+    major = register_chrdev(0, DEVICE, &fops);
+    printk(KERN_INFO "[monitor] loaded\n");
     return 0;
 }
 
-static void __exit monitor_exit(void)
+static void __exit exit_mod(void)
 {
-    unregister_chrdev(major, DEVICE_NAME);
+    unregister_chrdev(major, DEVICE);
     printk(KERN_INFO "[monitor] unloaded\n");
 }
 
-module_init(monitor_init);
-module_exit(monitor_exit);
+module_init(init_mod);
+module_exit(exit_mod);
 
 MODULE_LICENSE("GPL");
