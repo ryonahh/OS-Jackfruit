@@ -1,3 +1,5 @@
+// FULL ENGINE.C — REPLACE ENTIRE FILE
+
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -21,7 +23,6 @@
 #include "monitor/monitor_ioctl.h"
 
 #define STACK_SIZE (1024 * 1024)
-#define CONTAINER_ID_LEN 32
 #define CONTROL_PATH "/tmp/mini_runtime.sock"
 #define LOG_DIR "logs"
 
@@ -29,7 +30,7 @@ typedef enum { CMD_START, CMD_RUN, CMD_PS, CMD_LOGS, CMD_STOP } cmd_t;
 typedef enum { RUNNING, EXITED, KILLED } state_t;
 
 typedef struct container {
-    char id[CONTAINER_ID_LEN];
+    char id[32];
     pid_t pid;
     state_t state;
     int wait_fd;
@@ -58,8 +59,6 @@ typedef struct {
 static ctx_t *g_ctx;
 static char stack[STACK_SIZE];
 
-/* ================= CHILD ================= */
-
 int child_fn(void *arg)
 {
     request_t *r = arg;
@@ -75,8 +74,6 @@ int child_fn(void *arg)
     perror("exec");
     return 1;
 }
-
-/* ================= MONITOR ================= */
 
 void register_monitor(ctx_t *ctx, char *id, pid_t pid)
 {
@@ -102,8 +99,6 @@ void unregister_monitor(ctx_t *ctx, char *id, pid_t pid)
     ioctl(ctx->monitor_fd, MONITOR_UNREGISTER, &req);
 }
 
-/* ================= SIGNAL ================= */
-
 void sigchld(int sig)
 {
     int status;
@@ -126,7 +121,6 @@ void sigchld(int sig)
                     sprintf(res.msg, "Container %s finished", c->id);
                     send(c->wait_fd, &res, sizeof(res), 0);
                     close(c->wait_fd);
-                    c->wait_fd = -1;
                 }
                 break;
             }
@@ -134,8 +128,6 @@ void sigchld(int sig)
         }
     }
 }
-
-/* ================= SUPERVISOR ================= */
 
 int supervisor()
 {
@@ -230,8 +222,6 @@ int supervisor()
     }
 }
 
-/* ================= CLIENT ================= */
-
 int send_req(request_t *req)
 {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -251,8 +241,6 @@ int send_req(request_t *req)
     close(fd);
     return 0;
 }
-
-/* ================= MAIN ================= */
 
 int main(int argc, char *argv[])
 {
